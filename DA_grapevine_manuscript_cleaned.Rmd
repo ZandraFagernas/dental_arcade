@@ -1,0 +1,115 @@
+---
+title: "DA grapevine reads"
+author: "Zandra Fagernas"
+output: html_notebook
+---
+
+During an initial screening of a subset of the dataset, it was noticed that the samples have quite many reads from grapevine (Vitis vinifera). However, the bone samples also have a lot of grapevine reads - could they be environmental and not dietary? I mapped the human-removed reads (i.e. the data was mapped to the human reference genome, and all human reads were) to the Vitis vinifera reference genome using EAGER1, with mapping quality 37, and damage profiling turned on.
+
+```{r message=FALSE, warning=FALSE}
+library(readxl)
+library(ggpubr)
+library(lmerTest)
+library(lme4)
+library(janitor)
+library(tidyverse)
+library(ggeffects)
+```
+
+
+```{r}
+# Import data (EAGER report)
+grape_raw <- read_csv("<path_to>/Report_grapevine_mapping_eager1_20210120.csv") %>%
+  clean_names() %>%
+  dplyr::select(sample_name, number_reads_after_c_m_prior_mapping, mapped_reads_after_rm_dup, endogenous_dna_qf_percent, cluster_factor, dmg_1st_base_3, dmg_2nd_base_3, median_fragment_length)
+
+# Import metadata
+meta <- read.delim("<path_to>/DA_metadata_new.txt")
+
+# Combine with metadata
+grape_meta <- left_join(grape_raw, meta, by=c("sample_name"="LibraryID")) %>%
+  filter(!Type == "Blank")
+```
+
+Let's plot the percentage grapevine reads per sample. 
+
+```{r}
+# Set colours for individual
+my_colors = c("grey", "#C70E7B", "#A6E000", "#6C6C9D", "#1BB6AF")
+names(my_colors) = grape_meta$Individual %>% unique %>% sort
+
+# Change x to the variable you want to investigate
+endo_grape <- ggplot(grape_meta, aes(x=Type, y=endogenous_dna_qf_percent)) +
+  stat_boxplot(geom='errorbar') +
+  geom_boxplot() +
+  ylab("Percent grapevine reads") +
+  xlab("") +
+  scale_color_manual(values=my_colors) +
+  geom_point(aes(col=Individual)) +
+  theme_minimal()
+```
+
+Let's also take a look at the damage plots, from the output from DamageProfiler.
+
+```{bash eval=FALSE}
+## Code block to concatenate Damageprofiler freq files while adding a column for sample name as a third column.
+## Should be ran from the eager1 output directory where all sample subdirectories are. 
+
+## Create header
+echo -e "pos\t3pG>A\tsample" > output_file.txt
+## For each freq file, read line-by-line omitting the header line. Infer sample name from file path, and add that name as a third column. Then save all the lines form all the files into "output_file.txt"
+for file in */7-DnaDamage/*/3pGtoA_freq.txt ; do
+  while read line; do
+    sample_name=$(echo ${file} | cut -d '/' -f 1)
+    echo -e "${line}\t${sample_name}"
+  done < <(tail -n +2 ${file})
+done >> output_file.txt
+```
+
+```{r}
+# Load raw data
+grape_damage <- read.delim("<path_to>/grapevine_damage_5pCtoT_20210120.txt")
+
+# Load metadata
+meta <- read.delim("<path_to>/DA_metadata_new.txt")
+
+# Add metadata
+grape_damage_meta <- left_join(grape_damage, meta, by=c("sample"="LibraryID"))
+
+# Set colours for individual
+my_colors = c("grey", "#C70E7B", "#A6E000", "#6C6C9D", "#1BB6AF")
+names(my_colors) = grape_damage_meta$Individual %>% unique %>% sort
+
+# Plot
+damage_fig <- ggplot(grape_damage_meta, aes(x=pos, y=X5pC.T, group=sample, colour=Individual)) +
+  geom_line(size=1) +
+  ylab("5' C>T") +
+  xlab("Position") +
+  facet_wrap(~Type, scales = "free") +
+  scale_color_manual(values=my_colors) +
+  theme_minimal()
+```
+
+This is quite messy, so let's subset to only individuals with >500 reads mapped to grapevine (after quality filtering and duplicate removal), see reasoning in Mann et al. 2020. 
+
+```{r}
+# Get list of sample IDs with >500 reads
+grape_500 <- grape_meta %>%
+  filter(mapped_reads_after_rm_dup > 500) %>%
+  dplyr::select(sample_name)
+
+# Subset damage dataset
+grape_damage_500 <- left_join(grape_500, grape_damage_meta, by=c("sample_name" = "sample"))
+
+# Plot
+damage_fig_500 <- ggplot(grape_damage_500, aes(x=pos, y=X5pC.T, group=sample_name, colour=Individual)) +
+  geom_line(size=1) +
+  ylab("5' C>T") +
+  xlab("Position (bp)") +
+  facet_wrap(~Type) +
+  scale_color_manual(values=my_colors) +
+  theme_minimal()
+
+ggarrange(endo_grape, damage_fig_500, ncol=2, labels = c("A", "B"), common.legend = TRUE, legend = "right", widths = c(2,3))
+```
+

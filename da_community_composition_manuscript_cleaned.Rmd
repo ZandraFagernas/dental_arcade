@@ -1,0 +1,520 @@
+---
+title: 'Dental Arcade: Community composition'
+author: "Zandra Fagernas"
+output: html_document
+---
+
+This notebook contains analyses for studying differences in the microbial community composition for the Dental Arcade project. 
+
+```{r include=FALSE}
+library(decontam)
+library(microbiome)
+library(lme4)
+library(lmerTest)
+library(ggpubr)
+library(zCompositions)
+library(vegan)
+library(readxl)
+library(tidyverse)
+```
+
+# Decontam
+
+In order to remove both lab contaminants and environmental contaminants, we will use decontam to identify OTUs that are disproportionately prevalent in blanks and bone samples. This will be done on both genus and species level, as these are used for input in different analyses.
+
+## Import data
+
+```{r}
+genus <- read.delim("<path_to>/DA_MALT_cRefSeq_genus_summarized_20200616.txt")
+species <- read.delim("<path_to>/DA_MALT_cRefSeq_species_summarized_20200616.txt")
+
+meta <- read.delim("<path_to>/DA_metadata_new.txt")
+```
+
+The data needs to be fixed a bit before using it.
+
+```{r}
+# Transpose dataframe
+data <- genus %>% 
+  gather(SampleID, count, 2:ncol(.)) %>%
+  spread(X.Datasets, count) 
+
+# Remove ending from the sample IDs
+data <- data %>% 
+  mutate(SampleID = gsub(".SG1.1.2_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam", "", SampleID)) %>% 
+  mutate(SampleID = gsub(".SG1.1_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam", "", SampleID))
+
+# Remove blanks (for bone analysis)
+data_bone <- data %>%
+  filter(!SampleID %in% c("EXB037.A2101","EXB037.A2201","EXB037.A2301","EXB037.A2401","EXB037.A2501",
+                          "EXB037.A3301","LIB030.A0107","LIB030.A0108","LIB030.A0109","LIB030.A0110",
+                          "LIB030.A0111", "LIB030.A0115"))
+
+# Convert to matrix
+data_mat <- data.matrix(data[,2:ncol(data)])
+rownames(data_mat) <- data$SampleID
+
+data_mat_bone <- data.matrix(data_bone[,2:ncol(data_bone)])
+rownames(data_mat_bone) <- data_bone$SampleID
+
+# Order metadata file alphabetically
+meta <- meta[order(meta$LibraryID),]
+meta_bone <- meta %>%
+  filter(!Type == "Blank")
+```
+
+## decontam::prevalence 
+
+This methods uses prevalence of OTUs in blanks and bone samples to identify contaminants.
+
+```{r}
+# Assign contaminant status
+meta_bone$is.neg <- meta_bone$Type=="Bone"
+cont_bone <- isContaminant(data_mat_bone, method="prevalence", neg=meta_bone$is.neg, threshold = 0.8)
+
+# Check number of contaminants
+table(cont_bone$contaminant)
+
+# List of contaminants
+cont_bone_list <- as_tibble(rownames(cont_bone[which(cont_bone$contaminant=="TRUE"), ]))
+colnames(cont_bone_list)[1] <- "Genus"
+
+# Combine lists from blanks and soil samples
+cont_genus_list <- rbind(cont_blank_list, cont_bone_list) %>% unique()
+
+# Save for future use
+write.table(cont_genus_list, "<path_to>/DA_decontam_cRefSeq_genus_20210412.txt", row.names = FALSE)
+```
+
+Let's also check which cutoff suits the invididual tests best. 
+```{r}
+ggplot(cont_bone, aes(x=p)) +
+  geom_histogram(bins=100) 
+```
+
+
+## Alpha diversity
+
+### Data import and cleanup
+
+As input, we will use a species-level OTU table of all calculus samples, from MALT against the custom RefSeq database, from which probable contaminants (identified by decontam) will be removed. 
+```{r}
+# Load OTU table 
+raw_data <- read.delim("<path_to>/DA_MALT_cRefSeq_species_summarized_20200616.txt")
+colnames(raw_data)[1] <- "Species"
+
+# Fix sample names
+colnames(raw_data) <- gsub(".SG1.1.2_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam", 
+                           "", colnames(raw_data))
+colnames(raw_data) <- gsub(".SG1.1_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam",
+                           "", colnames(raw_data))
+
+# Load list of contaminant species
+cont <- read.delim("<path_to>/DA_decontam_cRefSeq_species_20210408.txt")
+
+# Remove bones, occlusal samples and blanks from raw data
+sample_table <- raw_data %>%
+  dplyr::select(-c("EXB037.A2101","EXB037.A2201","EXB037.A2301","EXB037.A2401","EXB037.A2501", "EXB037.A3301",
+            "LIB030.A0107","LIB030.A0108","LIB030.A0109","LIB030.A0110","LIB030.A0111", "LIB030.A0115",
+            "CDM045.Z0101", "CDM047.Z0101", "CDM053.J0101", "CDM054.A0101",
+            "CDM048.E0101", "CDM048.O0101", "CDM049.E0101", "CDM049.I0101"))
+
+# Remove contaminants from raw data
+otu_table <- anti_join(sample_table, cont)
+
+# Remove genera with no counts (i.e. only present in blanks/bones)
+otu_table$sum <- rowSums(otu_table[2:84])
+otu_table <- otu_table %>%
+  filter(!sum==0) %>%
+  dplyr::select(-sum)
+
+# Turn data into matrix
+otu_matrix <- as.matrix(otu_table[2:ncol(otu_table)])
+rownames(otu_matrix) <- otu_table$Species
+
+# Metadata
+meta <- read.delim("<path_to>/da_metadata_new.txt")
+```
+
+### Diversity index calculations
+
+We will use the R package microbiome to calculate the diversity indexes. I'm also keeping the observed number of species, as it may be useful for other analyses.
+
+```{r}
+# Compute all alpha diversity indexes and select only Shannon, inverese Simpson and observed species number
+alphas <- alpha(otu_matrix) %>%
+  dplyr::select(observed, diversity_shannon, diversity_inverse_simpson)
+
+# Move sample IDs from rownames to column
+alphas$LibraryID <- rownames(alphas)
+rownames(alphas) <- c()
+
+# Add metadata
+alpha_meta <- left_join(alphas, meta)  %>%
+  dplyr::select(LibraryID, everything())
+```
+
+### Statistics - Shannon Index
+
+Now we will try to find an optimal Box-Cox transformation of the data.
+
+```{r}
+MASS::boxcox(lm(diversity_shannon~ToothSide,data=alpha_meta))
+MASS::boxcox(lm(diversity_shannon~Jawbone*ToothSide*ToothPosition*TotalWeight_scaled, data=alpha_meta))
+```
+
+The dotted lines contain 1, which indicates that a no transformation is needed. 
+
+```{r}
+# Quantile-quantile plot 
+ggqqplot(alpha_meta$diversity_shannon)
+
+# Histogram
+hist(alpha_meta$diversity_shannon)
+```
+
+We can use a linear mixed effects model, accounting for random variation introduced by the individual.
+
+```{r}
+# Interaction model
+model1 <- lmer(diversity_shannon ~ Jawbone:ToothSide:ToothPosition:TotalWeight_scaled + (1|Individual), data = alpha_meta)
+
+# Additive model
+model2 <- lmer(diversity_shannon ~ Jawbone+ToothSide+ToothPosition+TotalWeight_scaled + (1|Individual), data = alpha_meta)
+
+# Compare interaction and additive models
+anova(model1, model2) # p>0.05, we can use simpler model
+
+# Model without tooth position
+model3 <- lmer(diversity_shannon ~ Jawbone+ToothSide+TotalWeight_scaled + (1|Individual), data = alpha_meta)
+
+# Compare models
+anova(model2, model3) # p>0.05, we can use simpler model
+
+# Model without jawbone
+model4 <- lmer(diversity_shannon ~ ToothSide+TotalWeight_scaled  + (1|Individual), data = alpha_meta)
+
+# Compare models
+anova(model3, model4) # p>0.05, we can use simpler model
+
+# Model without tooth side
+model5 <- lmer(diversity_shannon ~ TotalWeight_scaled + (1|Individual), data = alpha_meta)
+
+# Compare models
+anova(model4, model5) # p<0.05, use simpler model
+
+# Null model
+model0 <- lmer(diversity_shannon ~ 1 + (1|Individual), data = alpha_meta)
+
+# Compare models
+anova(model5, model0) # p<0.05, use simpler model
+
+# Summary of best fitting model
+summary(model0)
+```
+
+The best fitting model includes tooth position and tooth side.
+
+Let's test if individual or batches need to be included as random effects.
+
+```{r}
+rand(model5, reduce.terms = TRUE)
+```
+
+Individual needs to be included as a random effect. Batches do not need to be included.
+
+Let's check the model fit.
+
+```{r message=FALSE, warning=FALSE}
+plot(model0) 
+
+qqnorm(resid(model0))
+qqline(resid(model0)) 
+```
+
+Since the null model fits best, no figures are needed.
+
+### Statistics - Simpson
+
+Now we will try to find an optimal Box-Cox transformation of the data.
+
+```{r}
+MASS::boxcox(lm(diversity_inverse_simpson~ToothSide,data=alpha_meta))
+MASS::boxcox(lm(diversity_inverse_simpson~Jawbone*ToothSide*ToothPosition*TotalWeight_scaled, data=alpha_meta))
+```
+
+The dotted lines contain zero, which indicates that a log-transformation might be appropriate. 
+
+```{r}
+# Quantile-quantile plot 
+ggqqplot(log(alpha_meta$diversity_inverse_simpson))
+
+# Histogram
+hist(log(alpha_meta$diversity_inverse_simpson))
+```
+
+We can use a linear mixed effects model with log-transformed data, accounting for random variation introduced by the individual.
+
+```{r}
+# Interaction model
+model1 <- lmer(log(diversity_inverse_simpson) ~ Jawbone:ToothSide:ToothPosition:TotalWeight_scaled + (1|Individual), data = alpha_meta)
+
+# Additive model
+model2 <- lmer(log(diversity_inverse_simpson) ~ Jawbone+ToothSide+ToothPosition+TotalWeight_scaled + (1|Individual), data = alpha_meta)
+
+# Compare 
+anova(model1, model2) # p>0.05, simplify
+
+# Remove tooth position
+model3 <- lmer(log(diversity_inverse_simpson) ~ Jawbone+ToothSide+TotalWeight_scaled + (1|Individual), data = alpha_meta)
+
+# Compare i
+anova(model2, model3) # p>0.05, simplify
+
+# Remove tooth side
+model4 <- lmer(log(diversity_inverse_simpson) ~ Jawbone+TotalWeight_scaled + (1|Individual), data = alpha_meta)
+
+# Compare 
+anova(model3, model4) # p>0.05, simplify
+
+# Remove jawbone
+model5 <- lmer(log(diversity_inverse_simpson) ~ TotalWeight_scaled + (1|Individual), data = alpha_meta)
+
+# Compare 
+anova(model4, model5) #  p>0.05, simplify
+
+# Null model
+model0 <- lmer(log(diversity_inverse_simpson) ~ 1 + (1|Individual), data = alpha_meta)
+
+# Compare 
+anova(model5, model0) #  p<0.05, can't simplify
+
+# Summary of best fitting model
+summary(model5)
+```
+
+The best fitting model includes tooth position and total weight.
+
+Let's test if individual or batches need to be included as random effects.
+
+```{r}
+rand(model5, reduce.terms = TRUE)
+```
+
+Individual needs to be included as a random effect. Batches do not need to be included.
+
+Let's check the model fit.
+
+```{r message=FALSE, warning=FALSE}
+plot(model5)
+
+qqnorm(resid(model5))
+qqline(resid(model5)) 
+```
+
+And plot!
+
+```{r}
+# Set colours for individual
+my_colors = c("#C70E7B", "#A6E000", "#6C6C9D", "#1BB6AF")
+names(my_colors) = alpha_meta$Individual %>% unique %>% sort
+
+# Weight
+simpson_weight <- ggplot(alpha_meta, aes(x=TotalWeight_scaled, y=log(diversity_inverse_simpson))) +
+  geom_point(aes(col=Individual), show.legend = FALSE) +
+  scale_color_manual(values=my_colors) +
+  ylab("log(Inverse Simpson Index)") +
+  facet_grid(~Individual, scales = "free_x") +
+  xlab("Original sample weight (scaled)") +
+  theme_minimal()
+
+# Combine figures
+simpson_fig <- ggarrange(simpson_position, simpson_weight,
+                           ncol=1, nrow=2, 
+                           labels = c("(A)", "(B)"))
+```
+
+# PCA
+
+Here we study the community composition through a PCA. Input is an OTU table of summarized reads on genus level. Probable contaminants have been removed (as identified by decontam), and bones and blanks have been removed. 
+
+## Import data
+
+```{r}
+# Load OTU table 
+raw_data <- read.delim("<path_to>/DA_MALT_cRefSeq_genus_summarized_20200616.txt")
+colnames(raw_data)[1] <- "Genus"
+
+# Fix sample names
+colnames(raw_data) <- gsub(".SG1.1.2_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam", 
+                           "", colnames(raw_data))
+colnames(raw_data) <- gsub(".SG1.1_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam",
+                           "", colnames(raw_data))
+
+# Load metadata file and order in alphabetical order
+meta <- read.delim("<path_to>/DA_metadata_new.txt")
+meta <- meta[order(meta$LibraryID),] 
+
+# Load list of contaminant genera
+cont <- read.delim("<path_to>/DA_decontam_cRefSeq_genus_20210407.txt")
+
+# Remove bones and blanks from raw data
+sample_table <- raw_data %>%
+  dplyr::select(-c("EXB037.A2101","EXB037.A2201","EXB037.A2301","EXB037.A2401","EXB037.A2501", "EXB037.A3301",
+            "LIB030.A0107","LIB030.A0108","LIB030.A0109","LIB030.A0110","LIB030.A0111", "LIB030.A0115",
+            "CDM045.Z0101", "CDM047.Z0101", "CDM053.J0101", "CDM054.A0101"))
+
+# Remove occlusal samples
+sample_table <- sample_table %>%
+  dplyr::select(-c("CDM048.E0101", "CDM048.O0101", "CDM049.E0101", "CDM049.I0101"))
+
+# Remove contaminants from raw data
+otu_table <- anti_join(sample_table, cont)
+
+# Remove genera with no counts
+otu_table$sum <- rowSums(otu_table[2:84])
+otu_table <- otu_table %>%
+  filter(!sum==0) %>%
+  dplyr::select(-sum)
+
+# Turn the dataset into long format and order alphabetically
+megan_genus <- otu_table %>%
+  gather(sample, count, 2:84)
+colnames(megan_genus)[1] <- "genus"
+megan_genus <- megan_genus[order(megan_genus$sample),] 
+```
+
+## Prepare data
+
+```{r}
+# Turn data back into wide format, but with genus as columns and libraries as rows
+megan_genus_wide <- spread(megan_genus, genus, count, fill = 0)
+
+# Combine metadata and data file
+megan_genus_wide_meta <- left_join(megan_genus_wide, meta, by=c("sample" = "LibraryID"))
+```
+
+## Zero replacement, log ratio transform and PCA Functions
+
+Follow tutorial by Greg Gloor et al. for the multiplicative simple replacement zero-count correction and centered log ratio normalisation from (here)[https://github.com/ggloor/CoDa_microbiome_tutorial/wiki/Part-1:-Exploratory-Compositional-PCA-biplot], and put in a function.
+
+```{r}
+# Multiplicative zero replacement, with CLR transformation function "gloor"
+czm_clr_pca <- function(in_data){
+  ## Convert data to a matrix
+  wide_data <- in_data %>% 
+    dplyr::select(genus, sample, count) %>% 
+    spread(genus, count, fill = 0)
+  matrix <- as.matrix(wide_data[2:ncol(wide_data)])
+  rownames(matrix) <- wide_data$sample
+  ## Zero imputation through multiplicative simple replacement (estimated)
+  matrix.czm <- cmultRepl(matrix, label=0, method="CZM")
+  matrix.clr <- t(apply(matrix.czm, 1, function(x){log(x) - mean(log(x))}))
+  return(prcomp(matrix.clr))
+}
+
+# Apply function to data
+gloor_pca <- czm_clr_pca(megan_genus)
+```
+
+## Plotting 
+
+```{r}
+# Extract values
+pca_out <- as_tibble(gloor_pca$x)
+pca_out$sample <- megan_genus_wide_meta$sample
+pca_out_meta <- left_join(pca_out, meta, by=c("sample" = "LibraryID"))
+
+# Calculate percent explained per PC
+percentage <- round(gloor_pca$sdev / sum(gloor_pca$sdev) * 100, 2)
+percentage <- paste(colnames(pca_out), "(", paste( as.character(percentage), "%", ")", sep="") )
+```
+
+And make pretty plots
+
+```{r}
+# Set shapes for tooth position
+shapes = c(16, 17)
+names(shapes) = pca_out_meta$ToothPosition %>% unique()
+
+# Set colours for individual
+ind_colors = c("#C70E7B", "#A6E000", "#6C6C9D", "#1BB6AF")
+names(ind_colors) = pca_out_meta$Individual %>% unique %>% sort
+
+# Set colours for tooth side
+ts_colors = c("#C70E7B", "#A6E000", "#6C6C9D")
+names(ts_colors) = pca_out_meta$ToothSide %>% unique %>% sort
+
+# Individuals
+ind_pca <- ggplot(data = pca_out_meta, aes(x = PC1, y = PC2, colour=Individual)) +
+  geom_point(size=1, aes(stroke=5)) +
+  scale_color_manual(values=ind_colors) +
+  scale_shape_manual(values=shapes) +
+  xlab(percentage[1]) + 
+  ylab(percentage[2]) +
+  guides(fill=guide_legend(override.aes=list(shape=21, size=5))) +
+  theme_minimal()
+
+# Weight and tooth position
+result_pca <- ggplot(data = pca_out_meta, aes(x = PC1, y = PC2, colour=TotalWeight_scaled)) +
+  geom_point(size=3, aes(stroke=5, shape=ToothPosition)) +
+  scale_color_gradientn(colours=c("#1BB6AF", "#A6E000", "#C70E7B")) +
+  scale_shape_manual(values=shapes) +
+  xlab(percentage[1]) + 
+  ylab(percentage[2]) +
+  guides(fill=guide_legend(override.aes=list(shape=21, size=5))) +
+  theme_minimal()
+
+# Combine PCAs
+ggarrange(ind_pca, result_pca, ncol=2)
+```
+
+## PERMANOVA
+
+In order to see if the groupings are significantly different from each other, we will perform a PERMANOVA using the R package 'vegan'. Input data is sequence counts normalized in the same way as in the PCA above.
+
+```{r}
+# Turn data into matrix
+matrix <- as.matrix(megan_genus_wide[2:ncol(megan_genus_wide)])
+rownames(matrix) <- megan_genus_wide$sample
+  
+# Zero imputation through multiplicative simple replacement (estimated)
+matrix.czm <- cmultRepl(matrix, label=0, method="CZM")
+matrix.clr <- t(apply(matrix.czm, 1, function(x){log(x) - mean(log(x))}))
+
+# Remove blanks and bones from metadata file
+meta_samples <- meta %>%
+  filter(Type == "Calculus") %>%
+  filter(!ToothSide == "O")
+```
+
+And then we run the test.
+```{r}
+# Basic permanova with euclidean distance as metric
+permanova <- adonis2(matrix.clr ~ TotalWeight_scaled + ToothSide + Jawbone + ToothPosition + Individual, 
+                    data=meta_samples,
+                    permutations=9999, by="margin",
+                    method="euclidean")
+permanova
+
+permanova2 <- adonis2(matrix.clr ~ TotalWeight_scaled + ToothSide + Jawbone + ToothPosition, 
+                    data=meta_samples, strata=meta_samples$Individual,
+                    permutations=9999, by="margin",
+                    method="euclidean")
+permanova2
+
+# Check homogeneity condition
+dis_euc <- vegdist(matrix.clr, method="euclidean")
+model <- betadisper(dis_euc, meta_samples$Individual)
+anova(model)
+
+## Permutation test for F
+permutest(model, pairwise = TRUE, permutations = 99)
+
+## Tukey's Honest Significant Differences
+(model.HSD <- TukeyHSD(model))
+plot(model.HSD)
+
+## Plot the groups and distances to centroids on the first two PCoA axes
+plot(model)
+```

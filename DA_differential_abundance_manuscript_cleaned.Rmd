@@ -1,0 +1,252 @@
+---
+title: "Dental Arcade: Differential abundance"
+author: "Zandra Fagernaes"
+output: html_notebook
+---
+
+This notebook goes through the differential abundance analysis for the Dental Arcade project.
+
+```{r}
+library(janitor)
+library(tidyverse)
+library(ggpubr)
+```
+
+The software Songbird is used for differential abundance studies.Input data is a species level OTU table from a MALT run against the custom RefSeq database. Contaminants (blanks and bones) are cleaned out, and only taxa present in all four individuals are included. Blanks, bones, and occlusal samples are excluded. Another dataset is made where occlusal samples are included, to study the effect of disease on differential abundance.
+
+```{r}
+# Import raw data
+data <- read.delim("<path_to>/DA_MALT_cRefSeq_species_summarized_20200616.txt")
+colnames(data)[1] <- "Species"
+
+# Metadata
+meta <- read.delim("<path_to>/da_metadata_new.txt")
+
+# Fix sample names
+colnames(data) <- gsub(".SG1.1.2_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam", 
+                           "", colnames(data))
+colnames(data) <- gsub(".SG1.1_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam",
+                           "", colnames(data))
+
+# Remove bones, occlusal samples and blanks
+data <- data %>%
+  select(-c("EXB037.A2101","EXB037.A2201","EXB037.A2301","EXB037.A2401","EXB037.A2501", "EXB037.A3301",
+            "LIB030.A0107","LIB030.A0108","LIB030.A0109","LIB030.A0110","LIB030.A0111", "LIB030.A0115",
+            "CDM045.Z0101", "CDM047.Z0101", "CDM053.J0101", "CDM054.A0101",
+            #"CDM048.E0101", "CDM048.O0101", "CDM049.E0101", "CDM049.I0101"
+            ))
+
+# Import contaminants
+cont <- read.delim("<path_to>/DA_decontam_cRefSeq_species_20210408.txt")
+
+# Remove contaminants
+data_clean <- anti_join(data, cont)
+
+# Remove genera with no counts
+data_clean$sum <- rowSums(data_clean[2:88])
+data_clean <- data_clean %>%
+  filter(!sum==0) %>%
+  select(-sum)
+
+# Transpose
+data_clean_t <- data_clean %>%
+  gather(sample, count, 2:88) %>%
+  spread(Species, count)
+
+# Add column with individual
+ind <- meta %>%
+  select(LibraryID, Individual)
+data_clean_t_ind <- left_join(data_clean_t, ind, by=c("sample"="LibraryID"))
+
+# Turn into long format and remove zero counts
+data_long <- data_clean_t_ind %>%
+  gather(species, count, 2:275) %>%
+  filter(count > 0)
+
+# Count how many samples each species is found in per individual
+data_prevalence <- data_long %>%
+  select(species, Individual, sample) %>%
+  group_by(species, Individual) %>%
+  summarize(prevalence = n())
+
+# Filter for species present in >3 samples per individual
+data_prevalence <- data_prevalence %>%
+  filter(!prevalence<3)
+
+# Filter for species present in all four individuals
+data_list <- data_prevalence %>%
+  select(species, Individual) %>%
+  group_by(species) %>%
+  summarize(prevalence=n()) %>%
+  filter(prevalence==4) %>%
+  select(species)
+
+# Create final OTU table
+data_final <- left_join(data_list, data_clean, by=c("species"="Species"))
+colnames(data_final)[1] <- "# OTU ID"
+
+# Save OTU table
+write.table(data_final, "<path_to>/DA_MALT_cRefSeq_species_cleaned_occlusal_3sample_4ind_20210609.txt", sep="\t", row.names = FALSE, quote=FALSE)
+```
+
+# Make plot for Songbird results
+
+The data was run through Songbird with a model including all explanatory variables (also individual), as well as a null model. Different models were tried to find ne with good fit.
+
+```{r}
+# Import result dataset
+songbird <- read_tsv("<path_to>/all_species_cleaned_3sample_4ind_20210409_bestfit.tsv") %>%
+  clean_names()
+
+# Filter out only total weight (scaled), top and bottom ten
+weight <- songbird %>%
+  dplyr::select("featureid", "total_weight_scaled") %>%
+  arrange(total_weight_scaled) %>%
+  filter(row_number() %in% c(1:10, 137:146))
+
+# Filter out only jawbone, top and bottom ten
+jawbone <- songbird %>%
+  dplyr::select("featureid", "jawbone_t_maxilla") %>%
+  arrange(jawbone_t_maxilla) %>%
+  filter(row_number() %in% c(1:10, 137:146))
+
+# Filter out only toothside (i), top and bottom ten
+toothside_i <- songbird %>%
+  dplyr::select("featureid", "tooth_side_t_i") %>%
+  arrange(tooth_side_t_i) %>%
+  filter(row_number() %in% c(1:10, 137:146))
+
+# Filter out only toothside (l), top and bottom ten
+toothside_l <- songbird %>%
+  dplyr::select("featureid", "tooth_side_t_l") %>%
+  arrange(tooth_side_t_l) %>%
+  filter(row_number() %in% c(1:10, 137:146))
+
+# Filter out only tooth position, top and bottom ten
+toothposition <- songbird %>%
+  dplyr::select("featureid", "tooth_position_t_posterior") %>%
+  arrange(tooth_position_t_posterior) %>%
+  filter(row_number() %in% c(1:10, 137:146))
+
+# For dataset with occlusal, filter out only toothside (o), top and bottom ten
+toothside_o <- songbird %>%
+  dplyr::select("featureid", "tooth_side_t_o") %>%
+  arrange(tooth_side_t_o) %>%
+  filter(row_number() %in% c(1:10, 137:146))
+```
+
+And then we will create a divergent bar chart where all OTUs are labelled.
+
+```{r}
+# Weight
+ws <- ggplot(weight, aes(x = reorder(featureid, total_weight_scaled), y = total_weight_scaled))+
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(x = "", y = "") +
+  ggtitle("Total weight (scaled)") +
+  theme_classic()
+
+# Jawbone
+jaw <- ggplot(jawbone, aes(x = reorder(featureid, jawbone_t_maxilla), y = jawbone_t_maxilla))+
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(x = "", y = "") +
+  ggtitle("Jawbone (maxilla)") +
+  theme_classic()
+
+# Toothside i
+tsi <- ggplot(toothside_i, aes(x = reorder(featureid, tooth_side_t_i), y = tooth_side_t_i))+
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(x = "", y = "") +
+  ggtitle("Tooth surface (interproximal)") +
+  theme_classic()
+
+# Toothside o
+tsl <- ggplot(toothside_o, aes(x = reorder(featureid, tooth_side_t_o), y = tooth_side_t_o))+
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(x = "", y = "") +
+  ggtitle("Tooth surface (occlusal)") +
+  theme_classic()
+
+# Tooth position
+tp <- ggplot(toothposition, aes(x = reorder(featureid, tooth_position_t_posterior), y = tooth_position_t_posterior))+
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(x = "", y = "") +
+  ggtitle("Tooth position (posterior)") +
+  theme_classic()
+
+ggarrange(ws, jaw, tsi, tsl, tp, nrow=3, ncol=2)
+```
+
+# Dataset for 3D mapping
+
+For 3D mapping, we want to summarize the 10 most divergent taxa for each variable we present in the paper, and then average these values across individual. 
+
+```{r}
+# Normalize counts
+otu_norm <- as.data.frame(scale(raw_data[2:84], center=FALSE,
+                                 scale=colSums(raw_data[2:84])))
+otu_norm$otu <- raw_data$Species
+
+## Below, repeat for each variable
+
+# Select subset of genera
+otu_var <- left_join(weight, otu_norm, by=c("featureid"="otu")) %>%
+  select(-total_weight_scaled)
+
+# Transpose
+otu_var_t <- otu_var %>%
+  gather(sample, count, 2:84) %>%
+  spread(featureid, count)
+
+# Fix names
+otu_var_t <- otu_var_t %>%
+  clean_names()
+  
+# Sum anterior taxa per individual - tooth position
+otu_toothposition_sum <- otu_toothposition_t %>% 
+    rowwise() %>% 
+    mutate(ind_anterior = sum(c(methanobrevibacter_olleyae, actinomyces_radicidentis, actinomyces_urogenitalis, lachnoanaerobaculum_sp_obrc5_5, actinomyces_sp_oral_taxon_170, eubacterium_sulci, streptococcus_sanguinis, eubacterium_brachy, peptostreptococcus_anaerobius, actinomyces_slackii))) %>%
+  mutate(ind_posterior = sum(c(olsenella_sp_hmsc062g07, olsenella_uli, methanobrevibacter_smithii, olsenella_umbonata, olsenella_phocaeensis, bacteroides_pyogenes, dialister_invisus, atopobium_sp_oral_taxon_810, olsenella_sp_kh2p3, methanobrevibacter_wolinii))) %>%
+  select(sample, ind_anterior, ind_posterior)
+
+# Sum anterior taxa per individual - interproximal
+otu_var_sum <- otu_var_t %>% 
+    rowwise() %>% 
+    mutate(ind_other = sum(c(actinobaculum_sp_oral_taxon_183, fusobacterium_sp_oral_taxon_203, treponema_sp_omz_838, treponema_medium, treponema_lecithinolyticum, johnsonella_ignava, bacteroidetes_oral_taxon_274, centipeda_periodontii, actinomyces_gerencseriae, eubacterium_saphenum))) %>%
+  mutate(ind_ip = sum(c(actinomyces_sp_oral_taxon_170, olsenella_umbonata, methanobrevibacter_sp_ye315, bacteroides_pyogenes, methanobrevibacter_millerae, olsenella_sp_kh2p3, methanobrevibacter_oralis, methanobrevibacter_smithii, methanobrevibacter_wolinii, methanobrevibacter_olleyae))) %>%
+  select(sample, ind_other, ind_ip)
+
+# Sum anterior taxa per individual - weight
+otu_var_sum <- otu_var_t %>% 
+    rowwise() %>% 
+    mutate(ind_low = sum(c(fusobacterium_sp_oral_taxon_203, actinobaculum_sp_oral_taxon_183, schaalia_meyeri, treponema_lecithinolyticum, actinomyces_gerencseriae, actinomyces_sp_hmsc062g12, eubacterium_saphenum, desulfomicrobium_orale, schaalia_georgiae, filifactor_alocis))) %>%
+  mutate(ind_high = sum(c(gordonibacter_pamelaeae, capnocytophaga_ochracea, atopobium_sp_oral_taxon_810, capnocytophaga_sp_oral_taxon_332, capnocytophaga_sp_oral_taxon_863, capnocytophaga_sp_oral_taxon_326, capnocytophaga_sp_ch_dc_os43, lautropia_mirabilis, eikenella_corrodens, eikenella_sp_hmsc061c02))) %>%
+  select(sample, ind_low, ind_high)
+
+# Add metadata
+otu_var_sum_meta <- left_join(meta, otu_var_sum, by=c("LibraryID"="sample")) %>%
+  filter(Type == "Calculus") %>%
+  filter(!ToothSide == "O")
+
+# Summarize per location
+otu_var_mapping <- otu_var_sum_meta %>%
+  select(ToothNr, ToothSide, ToothClass, ind_low, ind_high) %>%
+  group_by(ToothNr, ToothSide, ToothClass) %>%
+  summarize(low_mass_taxa = mean(ind_low), 
+            high_mass_taxa = mean(ind_high))
+
+# Save
+write.table(otu_var_mapping ,"<path_to>/mass_species_20210610.txt", row.names = FALSE, quote=FALSE, sep="\t")
+```
+
+
+
+
+
+
+
+

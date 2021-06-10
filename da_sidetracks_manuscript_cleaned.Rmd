@@ -1,0 +1,468 @@
+---
+title: 'Dental Arcade: Sidetracks'
+author: "Zandra Fagernas"
+output: html_document
+---
+
+In this document, all the analyses in the Dental Arcade project that do not fit under any of the other larger umbrellas are collected. 
+
+
+```{r message=FALSE, warning=FALSE}
+library(readxl)
+library(ggpubr)
+library(lmerTest)
+library(lme4)
+library(janitor)
+library(tidyverse)
+library(ggeffects)
+library(MASS)
+```
+
+## DNA preservation
+
+To make sure that there are no differences in DNA preservation (damage) across the oral cavity, the data has been mapped to Tannerella forsythia (present in all individuals). 
+
+```{r warning = FALSE, message=FALSE}
+# Import data (EAGER report)
+tf_raw <- read_csv("<path_to>/report_tannerella_forsythia_20200806.csv") %>%
+  clean_names() %>%
+  dplyr::select(sample_name, dmg_1st_base_5, median_fragment_length)
+
+# Import metadata
+meta <- read.delim("<path_to>/DA_metadata_new.txt")
+
+# Add metadata
+tf_meta <- left_join(tf_raw, meta, by=c("sample_name"="LibraryID"))
+
+# Remove bones and blanks
+tf_meta <- tf_meta %>%
+  filter(!Type %in% c("Bone", "Blank"))
+```
+
+Now we will try to find an optimal Box-Cox transformation of the data.
+
+```{r}
+MASS::boxcox(lm(dmg_1st_base_5~Jawbone,data=tf_meta))
+MASS::boxcox(lm(dmg_1st_base_5~Jawbone*ToothSide*ToothPosition*TotalWeight_scaled, data=tf_meta))
+```
+
+For all tested variables, zero is between the dotted lines. This indicates that log-transformation is reasonable. Let's check distribution of the data after log-transformation.
+
+```{r}
+# Quantile-quantile plot 
+ggqqplot(log(tf_meta$dmg_1st_base_5))
+
+# Histogram
+hist(log(tf_meta$dmg_1st_base_5))
+```
+
+Log-transforming the data looks good!
+
+Let's test if Individual or extraction/library batch needs to be included as a random effect.
+
+```{r}
+rand(model1, reduce.terms = TRUE)
+```
+
+For all models, random effects for individual are needed.
+
+We can use a linear mixed effects model with log-transformed data, accounting for random variation introduced by the individual, to find predictors of the amount of human DNA in a sample.
+
+```{r message=FALSE, warning=FALSE}
+# Full interaction model
+model1 <- lmer(log(dmg_1st_base_5) ~ Jawbone:ToothSide:ToothPosition:TotalWeight_scaled + (1|Individual), data = tf_meta)
+
+# Full additive model
+model2 <- lmer(log(dmg_1st_base_5) ~ Jawbone + ToothSide + ToothPosition + TotalWeight_scaled + (1|Individual) , data = tf_meta)
+
+# Compare interaction and additive models
+anova(model1, model2) # p>0.05, we can use simpler model
+
+# Model without tooth position
+model3 <- lmer(log(dmg_1st_base_5) ~ Jawbone + ToothSide + TotalWeight_scaled + (1|Individual), data = tf_meta)
+
+# Compare models
+anova(model2, model3) # p>0.05, we can use simpler model
+
+# Drop jawbone?
+model4 <- lmer(log(dmg_1st_base_5) ~ ToothSide + TotalWeight_scaled + (1|Individual), data = tf_meta)
+
+# Compare models
+anova(model3, model4) # p>0.05, we can use simpler model
+
+# Drop total weight?
+model5 <- lmer(log(dmg_1st_base_5) ~ TotalWeight_scaled + (1|Individual), data = tf_meta)
+
+# Compare models
+anova(model4, model5) # p>0.05, can't simplify
+```
+
+
+```{r message=FALSE, warning=FALSE}
+plot(model4)
+
+qqnorm(resid(model4))
+qqline(resid(model4))
+```
+
+Now let's plot the data for the supplement.
+
+```{r}
+# Set colours for individual
+my_colors = c("#C70E7B", "#A6E000", "#6C6C9D", "#1BB6AF")
+names(my_colors) = tf_meta$Individual %>% unique %>% sort
+
+dmg_fig <- ggplot(tf_meta, aes(x=ToothSide, y=dmg_1st_base_5)) +
+  stat_boxplot(geom='errorbar') +
+  geom_boxplot(outlier.shape=NA) +
+  geom_jitter(aes(col=TotalWeight_scaled), width = 0.1) +
+  scale_color_gradientn(colours=c("#1BB6AF", "#A6E000", "#C70E7B")) +
+  ylab("Damage 1st base 5'") +
+  xlab("Tooth surface") +
+  theme_minimal()
+```
+
+## Human reads
+
+In order to investigate the human DNA content of the calculus samples, without being influenced by contamination, PMDtools was used (through EAGER) on deduplicated reads to filter out reads with damage (threshold 3) from all HG19-mapping reads (mapping quality 37). The analysis follows this tutorial: https://ourcodingclub.github.io/tutorials/mixed-models/. Seeing as we saw in the damage-analysis that occlusal sides of teeth have higher damage, we will remove them from this analysis, as they break the basic assumption of that proportion damaged human reads scales up to the proportion of total human reads.
+
+```{r warning = FALSE, message=FALSE}
+# Import data (cleaned EAGER report)
+PMDreads <- read_csv("<path_to>/DA_pmd3reads_20200514.csv")
+
+# Import metadata
+meta <- read.delim("<path_to>/DA_metadata_new.txt")
+
+# Calculate proportion of damaged human reads to all reads in library
+PMDreads$proportion_PMD_reads <- PMDreads$mapped_reads_after_RMDup/PMDreads$reads_after_CM_prior_mapping
+
+# Add metadata
+PMD_meta <- left_join(PMDreads, meta, by=c("sample_name"="LibraryID"))
+
+# Remove bones, blanks and occlusal samples
+PMD_meta <- PMD_meta %>%
+  filter(!Type %in% c("Bone", "Blank")) %>% 
+  filter(!ToothSide == "O")
+
+# Find mean per sampling site for visualisation
+PMD_summary <- PMD_meta %>%
+  group_by(ToothNr, ToothSide, ToothClass, Jawbone) %>%
+  summarize(PMD_mean = mean(proportion_PMD_reads))
+PMD_summary$PMD_log <- log(PMD_summary$PMD_mean)
+```
+
+
+Now we will try to find an optimal Box-Cox transformation of the data.
+
+```{r}
+MASS::boxcox(lm(proportion_PMD_reads~TotalWeight_scaled,data=PMD_meta))
+MASS::boxcox(lm(proportion_PMD_reads~Jawbone*ToothSide*ToothPosition, data=PMD_meta))
+```
+
+For all tested variables, as well as the full interaction model, zero is between the dotted lines. This indicates that log-transformation is reasonable. Let's check distribution of the data after log-transformation.
+
+```{r}
+# Quantile-quantile plot 
+ggqqplot(log(PMD_meta$proportion_PMD_reads))
+
+# Histogram
+hist(log(PMD_meta$proportion_PMD_reads))
+```
+
+Let's test if Individual or extraction/library batch needs to be included as a random effect.
+
+```{r}
+rand(model1, reduce.terms = TRUE)
+```
+
+For all models, no random effects ae needed. Weight will, however, be included, since it was earlier found to be associated with damage.
+
+We can use a linear mixed effects model with log-transformed data, accounting for random variation introduced by the individual, to find predictors of the amount of human DNA in a sample.
+
+```{r message=FALSE, warning=FALSE}
+# Full interaction model
+model1 <- lmer(log(proportion_PMD_reads) ~ Jawbone:ToothSide:ToothPosition + (1|TotalWeight_scaled), data = PMD_meta)
+
+# Full additive model
+model2 <- lmer(log(proportion_PMD_reads) ~ Jawbone + ToothSide + ToothPosition  + (1|TotalWeight_scaled), data = PMD_meta)
+
+# Compare interaction and additive models
+anova(model1, model2) # p>0.05, we can use simpler model
+
+# Model without jawbone 
+model3 <- lmer(log(proportion_PMD_reads) ~ ToothSide + ToothPosition + (1|TotalWeight_scaled) , data = PMD_meta)
+
+# Compare models
+anova(model2, model3) # p>0.05, we can use simpler model
+
+# Drop tooth side
+model4 <- lmer(log(proportion_PMD_reads) ~ ToothPosition + (1|TotalWeight_scaled), data = PMD_meta)
+
+# Compare models
+anova(model3, model4) # p>0.05, we can use simpler model
+
+# Null model
+model0 <- lmer(log(proportion_PMD_reads) ~ 1 + (1|TotalWeight_scaled), data = PMD_meta)
+
+# Compare models
+anova(model4, model0) # p>0.05, null model can be retained
+
+# Summary of best fitting model
+summary(model0)
+```
+This means that there are no significant predictors of the proportion of human reads in calculus, i.e. it is completely random.
+
+Let's check the model fit. 
+
+```{r message=FALSE, warning=FALSE}
+plot(model0)
+
+qqnorm(resid(model0))
+qqline(resid(model0))
+```
+
+
+## DNA yield
+
+Here we will see if normalized DNA yield (ng/mg) differs across the dental arcade. The analysis follows this tutorial: https://ourcodingclub.github.io/tutorials/mixed-models/. 
+
+```{r message=FALSE, warning=FALSE}
+# Import data
+labwork <- read_excel("<path_to>/Dental_Arcade_labwork.xlsx")
+labwork$Yield_ng_per_mg <- as.numeric(labwork$Yield_ng_per_mg)
+labwork$TotalWeight <- as.numeric(labwork$TotalWeight)
+
+# Remove bones, occlusal samples, positive controls and blanks, as well as failed extract
+labwork <- labwork %>%
+  filter(!ToothClass == "NA") %>%
+  filter(!PandoraID == "CDM041.Q0101") %>%
+  filter(!ToothSide == "O")
+
+# Set colors
+my_colors <- c("#C70E7B", "#A6E000", "#FC6882", "#1BB6AF" )
+names(my_colors) <- labwork$Individual %>% unique()
+
+# Find mean per sampling site for visualisation
+yield_summary <- labwork %>%
+  group_by(ToothNr, ToothSide, ToothClass, Jawbone) %>%
+  summarize(yield_mean = mean(Yield_ng_per_mg))
+yield_summary$yield_sqrt <- sqrt(yield_summary$yield_mean)
+```
+
+We have one explanatory variable that is continuous, which means we should standardise it. Let's center and scale it. 
+
+```{r}
+labwork$TotalWeight_scaled <- scale(labwork$TotalWeight, center = TRUE, scale = TRUE)
+```
+
+Now we will try to find an optimal Box-Cox transformation of the data.
+
+```{r}
+MASS::boxcox(lm(Yield_ng_per_mg~ToothSide,data=labwork))
+MASS::boxcox(lm(Yield_ng_per_mg~Jawbone*ToothSide*ToothPosition*TotalWeight_scaled, data=labwork))
+```
+
+The Box-Cox transformation give a lambda around 0.5, which suggests a square root transformation is appropriate. 
+
+```{r message=FALSE, warning=FALSE}
+# Quantile-quantile plot 
+ggqqplot(sqrt(labwork$Yield_ng_per_mg))
+
+# Histogram
+hist(sqrt(labwork$Yield_ng_per_mg))
+```
+
+And then on to some models!
+
+```{r message=FALSE, warning=FALSE}
+# Full interaction model
+model1 <- lmer(sqrt(Yield_ng_per_mg) ~ Jawbone:ToothSide:ToothPosition:TotalWeight_scaled + (1|Individual), data = labwork)
+
+# Full additive model
+model2 <- lmer(sqrt(Yield_ng_per_mg) ~ Jawbone+ToothSide+ToothPosition+TotalWeight_scaled + (1|Individual), data = labwork)
+
+# Compare interaction and additive models
+anova(model1, model2) # p>0.05, we can use simpler model
+
+# Model without jawbone 
+model3 <- lmer(sqrt(Yield_ng_per_mg) ~ ToothSide+ToothPosition+TotalWeight_scaled + (1|Individual), data = labwork)
+
+# Compare models
+anova(model2, model3) # p>0.05, we can use simpler model
+
+# Drop tooth position
+model4 <- lmer(sqrt(Yield_ng_per_mg) ~ ToothSide+TotalWeight_scaled + (1|Individual), data = labwork)
+
+# Compare models
+anova(model3, model4) # p>0.05, we can use simpler model
+
+# Drop weight
+model5 <- lmer(sqrt(Yield_ng_per_mg) ~ ToothSide + (1|Individual), data = labwork)
+
+# Compare models
+anova(model4, model5) # p>0.05, we can use simpler mode
+
+# Null model
+model0 <- lmer(sqrt(Yield_ng_per_mg) ~ 1 + (1|Individual), data = labwork)
+
+# Compare models
+anova(model5, model0) # p>0.05, we can use simpler mode
+
+# Summary of best fitting model
+summary(model0)
+```
+The null model fits best, indicating that yield is random.
+
+Let's test if Individual or extraction/library batch need to be included as random effects.
+
+```{r}
+rand(model0, reduce.terms = TRUE)
+```
+
+For all models,  the individual is necessary as a random effect.
+
+Let's check the model fit.
+
+```{r message=FALSE, warning=FALSE}
+plot(model0)
+
+qqnorm(resid(model0))
+qqline(resid(model0))
+```
+
+
+## Contaminants
+
+In theory, the amount of environmental contaminations could differ between sampling locations, as they are more/less protected from colonization from the burial ground. Let's use the putative contaminant species identified by decontam to investigate this by linear mixed models. Occlusal samples will be left in, as contamination is postmortem and will not be affected by their specific composition.
+
+```{r message=FALSE, warning=FALSE}
+# Import OTU table
+species <- read.delim("<path_to>/DA_MALT_cRefSeq_species_summarized_20200616.txt")
+colnames(species)[1] <- "Species"
+
+# Import contaminant genera list
+cont <- read.delim("<path_to>/DA_decontam_cRefSeq_species_bone_20210408.txt")
+
+# Import metadata
+meta <- read.delim("<path_to>/DA_metadata_new.txt")
+
+# Select only contaminants
+contaminants <- right_join(species, cont)
+
+# Fix sample names
+colnames(contaminants) <- gsub(".SG1.1.2_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam", 
+                           "", colnames(contaminants))
+colnames(contaminants) <- gsub(".SG1.1_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam",
+                           "", colnames(contaminants))
+
+# Remove bones and blanks from raw data
+contaminants <- contaminants %>%
+  dplyr::select(-c("EXB037.A2101","EXB037.A2201","EXB037.A2301","EXB037.A2401","EXB037.A2501", "EXB037.A3301",
+            "LIB030.A0107","LIB030.A0108","LIB030.A0109","LIB030.A0110","LIB030.A0111", "LIB030.A0115",
+            "CDM045.Z0101", "CDM047.Z0101", "CDM053.J0101", "CDM054.A0101"))
+
+# Remove genera with no counts
+contaminants$sum <- rowSums(contaminants[2:88])
+contaminants <- contaminants %>%
+  filter(!sum==0) %>%
+  dplyr::select(-sum)
+
+# Transpose dataframe
+contaminants_transpose <- contaminants %>%
+  gather(sample, count, 2:88) %>%
+  spread(Species, count)
+
+# Sum all contaminant reads and remove other columns
+contaminants_transpose$sum <- rowSums(contaminants_transpose[2:216])
+cont_sum <- contaminants_transpose %>%
+  dplyr::select(sample, sum)
+
+# Add metadata
+cont_meta <- left_join(cont_sum, meta, by=c("sample"="LibraryID"))
+
+# Change into proportion of total reads
+cont_meta$prop_cont <- cont_meta$sum/cont_meta$raw_reads
+
+# For mapping, summarize over location
+cont_summarized <- cont_meta %>%
+  group_by(ToothNr, ToothSide, ToothClass, Jawbone) %>%
+  summarize(cont_mean=mean(prop_cont))
+cont_summarized$cont_log <- log(cont_summarized$cont_mean)
+```
+
+Now we will try to find an optimal Box-Cox transformation of the data.
+
+```{r}
+MASS::boxcox(lm(prop_cont~TotalWeight_scaled,data=cont_meta))
+MASS::boxcox(lm(prop_cont~Jawbone*ToothSide*ToothPosition*TotalWeight_scaled, data=cont_meta))
+```
+
+Optimal transformation (0) seems to be log. 
+
+```{r message=FALSE, warning=FALSE}
+# Quantile-quantile plot 
+ggqqplot(log(cont_meta$prop_cont))
+
+# Histogram
+hist(log(cont_meta$prop_cont))
+```
+
+Looking fine!
+
+And then on to some models!
+
+```{r message=FALSE, warning=FALSE}
+# Full interaction model
+model1 <- lmer(log(prop_cont) ~ Jawbone:ToothSide:ToothPosition:TotalWeight_scaled + (1|Individual), data = cont_meta)
+
+# Full additive model
+model2 <- lmer(log(prop_cont) ~ Jawbone+ToothSide+ToothPosition+TotalWeight_scaled + (1|Individual), data = cont_meta)
+
+# Compare interaction and additive models
+anova(model1, model2) # p>0.05, simplify
+
+# Remove jawbone
+model3 <- lmer(log(prop_cont) ~ ToothSide+ToothPosition+TotalWeight_scaled + (1|Individual), data = cont_meta)
+
+# Compare models
+anova(model2, model3) # p>0.05, simplify
+
+# Remove tooth position
+model4 <- lmer(log(prop_cont) ~ ToothSide+TotalWeight_scaled + (1|Individual), data = cont_meta)
+
+# Compare models
+anova(model3, model4) # p>0.05, simplify
+
+# Remove weight
+model5 <- lmer(log(prop_cont) ~ ToothSide + (1|Individual), data = cont_meta)
+
+# Compare models
+anova(model4, model5) # p>0.05, simplify
+
+# Null model
+model0 <- lmer(log(prop_cont) ~ 1 + (1|Individual), data = cont_meta)
+
+# Compare models
+anova(model5, model0) # p>0.05, simplify
+
+# Summary of best fitting model
+summary(model0)
+```
+
+Let's test if individual needs to be included as a random effect.
+
+```{r}
+rand(model1, reduce.terms = TRUE)
+```
+
+Individual is significant, and will need to be included as a random effect.
+
+Let's check the model fit.
+
+```{r message=FALSE, warning=FALSE}
+plot(model0) 
+
+
+qqnorm(resid(model0))
+qqline(resid(model0)) 
+```

@@ -1,0 +1,256 @@
+---
+title: "DA functional analysis"
+author: "Zandra Fagernaes"
+date: "4/20/2020"
+output: html_document
+---
+
+In this notebook, I go through the functional analyses done for the "Dental Arcade" project.
+
+```{r}
+library(janitor)
+library(vegan)
+library(decontam)
+library(zCompositions)
+library(tidyverse)
+```
+
+## Gene families
+
+HUMANn2 was used to extract functional KO terms from the data. The abundances were normalized to CPM (copies per million). 
+
+```{r}
+# Load data
+raw_data <- read.delim("<path_to>/humann2.genefamilies.all.cpm.ko_20200803.tsv")
+
+# Load metadata
+meta <- read.delim("<path_to>/DA_metadata_new.txt")
+```
+
+We need to clean up the data a bit before we can use it.
+
+```{r}
+# Remove unnecessary ending from sample IDs
+colnames(raw_data) <- gsub(".SG1.1_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam_Abundance.RPKs", "", colnames(raw_data))
+colnames(raw_data) <- gsub(".SG1.1.2_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam_Abundance.RPKs", "", colnames(raw_data))
+
+# Change name of first column
+colnames(raw_data)[1] <- "gene_family" 
+```
+
+HUMANn2 outputs both an overall abundance for a gene family, and the abundances of each species by gene family, into the same table. We only want to use the overall abundances for now, so let's remove all the other things.
+
+```{r}
+# Split gene family into two columns by pipe
+total_data <- raw_data %>%
+  separate(gene_family, c("gene_family", "remove"), "\\|")
+
+# Select only rows where "remove" is NA (i.e. no species assignment)
+total_data <- total_data %>%
+  filter(is.na(remove)) %>%
+  dplyr::select(-remove)
+
+# Let's also remove the 'unmapped' and 'ungrouped' rows
+total_data <- total_data %>%
+  filter(!gene_family %in% c("UNMAPPED", "UNGROUPED"))
+```
+
+### decontam
+
+First, we'll pretend that this is an OTU-table and run it through decontam, with both bones and blanks as controls separately.
+
+The data needs to be fixed a bit before using it.
+
+```{r}
+# Transpose dataframe
+decont_data <- total_data %>% 
+  gather(SampleID, count, 2:ncol(.)) %>%
+  spread(gene_family, count) 
+
+# Convert to matrix
+decont_mat <- data.matrix(decont_data[,2:ncol(decont_data)])
+rownames(decont_mat) <- decont_data$SampleID
+
+# Order metadata file alphabetically
+meta <- meta[order(meta$LibraryID),] 
+```
+
+We will use the decontam::prevalence method. This method uses prevalence of OTUs in blanks and bone samples to identify contaminants.
+
+```{r}
+# Assign contaminant status
+meta$is.neg <- meta$Type=="Bone"
+cont_species_bone <- isContaminant(decont_mat, method="prevalence", neg=meta$is.neg, threshold = 0.5)
+
+# Check number of contaminants
+table(cont_species_bone$contaminant)
+
+# List of contaminants
+cont_species_bone_list <- as_tibble(rownames(cont_species_bone[which(cont_species_bone$contaminant=="TRUE"), ]))
+colnames(cont_species_bone_list)[1] <- "gene_family"
+
+# Combine lists from blanks and bone samples
+cont_species_list <- rbind(cont_species_blank_list, cont_species_bone_list) %>% unique()
+
+# Save for future use
+write.table(cont_species_list, "<path_to>/DA_decontam_gene_families_05_20210216.txt", row.names = FALSE)
+```
+
+### Identifying best cutoff
+
+```{r}
+ggplot(cont_species_bone, aes(x=p)) +
+  geom_histogram(bins=100) 
+```
+
+Now let's create a final, filtered dataset to run analyses on! 
+
+```{r}
+# Remove contaminants
+cont_species_list <- read_tsv("<path_to>/DA_decontam_gene_families_05_20210216.txt")
+decont_filter_data <- anti_join(total_data, cont_species_list)
+
+# Remove blanks, occlusal samples and bones
+sample_data <- decont_filter_data %>%
+  dplyr::select(-c("EXB037.A2101","EXB037.A2201","EXB037.A2301","EXB037.A2401","EXB037.A2501", "EXB037.A3301",
+            "LIB030.A0107","LIB030.A0108","LIB030.A0109","LIB030.A0110","LIB030.A0111", "LIB030.A0115",
+            "CDM045.Z0101", "CDM047.Z0101", "CDM053.J0101", "CDM054.A0101",
+            "CDM048.E0101", "CDM048.O0101", "CDM049.E0101", "CDM049.I0101"))
+
+# Remove gene families with no counts
+sample_data$sum <- rowSums(sample_data[2:84])
+sample_data <- sample_data %>%
+  filter(!sum==0) %>%
+  dplyr::select(-sum)
+
+# Save dataset
+write.table(sample_data, "<path_to>/DA_gene_families_filtered_samples_20210216.txt", row.names = FALSE)
+```
+
+### PCA
+
+## Import data
+
+```{r}
+# Load filtered gene family table 
+gene_table <- read.csv("<path_to>/DA_gene_families_filtered_samples_20210216.txt",
+                       sep = "" )
+
+# Load metadata file and order in alphabetical order
+meta <- read.delim("<path_to>/DA_metadata_new.txt")
+meta <- meta[order(meta$LibraryID),] 
+
+# Remove blanks, occlusal samples and bones from metadata
+meta <- meta %>%
+  filter(Type == "Calculus") %>%
+  filter(!ToothSide == "O")
+
+# Turn the dataset into long format and order alphabetically
+gene_long <- gene_table %>%
+  gather(sample, count, 2:84)
+gene_long <- gene_long[order(gene_long$sample),] 
+
+# Turn data back into wide format, but with gene families as columns and libraries as rows
+gene_wide <- spread(gene_long, gene_family, count, fill = 0)
+
+# Combine metadata and data file
+gene_wide_meta <- left_join(gene_wide, meta, by=c("sample" = "LibraryID"))
+
+# Multiplicative zero replacement, with CLR transformation function "gloor"
+czm_clr_gene <- function(in_data){
+  ## Convert data to a matrix
+  wide_data <- in_data %>% 
+    dplyr::select(gene_family, sample, count) %>% 
+    spread(gene_family, count, fill = 0)
+  matrix <- as.matrix(wide_data[2:ncol(wide_data)])
+  rownames(matrix) <- wide_data$sample
+  ## Zero imputation through multiplicative simple replacement (estimated)
+  matrix.czm <- cmultRepl(matrix, label=0, method="CZM")
+  matrix.clr <- t(apply(matrix.czm, 1, function(x){log(x) - mean(log(x))}))
+  return(prcomp(matrix.clr))
+}
+
+# Apply function to data
+gene_pca <- czm_clr_gene(gene_long)
+
+# Extract values
+gene_pca_out <- as_tibble(gene_pca$x)
+gene_pca_out$sample <- gene_wide_meta$sample
+gene_pca_out_meta <- left_join(gene_pca_out, meta, by=c("sample" = "LibraryID"))
+
+# Calculate percent explained per PC
+gene_percentage <- round(gene_pca$sdev / sum(gene_pca$sdev) * 100, 2)
+gene_percentage <- paste(colnames(gene_pca_out), "(", paste( as.character(gene_percentage), "%", ")", sep="") )
+
+# Set shapes for individual
+shapes = c(15,16,17)
+names(shapes) = gene_pca_out_meta$ToothSide %>% unique %>% sort
+
+# Set colours for factor
+my_colors = c("#C70E7B", "#A6E000", "#6C6C9D", "#1BB6AF") # 
+names(my_colors) = gene_pca_out_meta$Individual %>% unique %>% sort
+
+p <- ggplot(data = gene_pca_out_meta, aes(x = PC1, y = PC2, colour=Individual)) +
+  geom_point(size=3, aes(stroke=5)) +
+  #scale_color_gradientn(colours=c("#1BB6AF", "#A6E000", "#C70E7B","#6C6C9D")) +
+  scale_color_manual(values=my_colors) +
+  scale_shape_manual(values=shapes) +
+  #facet_wrap(~Individual) +
+  xlab(gene_percentage[1]) + 
+  ylab(gene_percentage[2]) +
+  guides(fill=guide_legend(override.aes=list(shape=21, size=5))) +
+  theme_minimal()
+```
+
+### PERMANOVA
+
+In order to see if the groupings are significantly different from each other, we will perform a PERMANOVA using the R package 'vegan'. Input data is sequence counts normalized in the same way as in the PCA above.
+
+```{r}
+# Turn data into matrix
+matrix <- as.matrix(gene_wide[2:ncol(gene_wide)])
+rownames(matrix) <- gene_wide$sample
+  
+# Zero imputation through multiplicative simple replacement (estimated)
+matrix.czm <- cmultRepl(matrix, label=0, method="CZM")
+matrix.clr <- t(apply(matrix.czm, 1, function(x){log(x) - mean(log(x))}))
+
+# Remove blanks and bones from metadata file
+meta_samples <- meta %>%
+  filter(Type == "Calculus") %>%
+  filter(!ToothSide == "O")
+```
+
+
+And run test
+
+```{r}
+# Basic permanova with euclidean distance as metric
+permanova1 <- adonis2(matrix.clr ~ Individual + TotalWeight_scaled + ToothSide + Jawbone + ToothPosition, 
+                    data=meta_samples, 
+                    permutations=999, by="margin",
+                    method="euclidean")
+
+permanova2 <- adonis2(matrix.clr ~ TotalWeight_scaled + ToothSide + Jawbone + ToothPosition, 
+                    data=meta_samples, strata=meta_samples$Individual,
+                    permutations=999, by="margin",
+                    method="euclidean")
+permanova1
+
+
+
+# Check homogeneity condition
+dis_euc <- vegdist(matrix.clr, method="euclidean")
+model <- betadisper(dis_euc, meta_samples$ToothPosition)
+anova(model)
+
+## Permutation test for F
+permutest(model, pairwise = TRUE, permutations = 99)
+
+## Tukey's Honest Significant Differences
+(model.HSD <- TukeyHSD(model))
+plot(model.HSD)
+
+## Plot the groups and distances to centroids on the first two PCoA axes
+plot(model)
+```

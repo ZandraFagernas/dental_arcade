@@ -1,0 +1,324 @@
+---
+title: 'Dental Arcade: Preservation'
+author: "Zandra Fagernas"
+output: html_document
+---
+
+This script assessess presevation for the dental calculus samples used in the "Dental Arcade" project. The aim is to identify samples that are too poorly preserved to show an authentic oral mciobiome signal, and may thereby skew signals in downstream analyses.
+
+```{r message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(fig.width=12, fig.height=6) 
+
+library(zCompositions)
+library(ggpubr)
+library(tidyverse)
+```
+
+
+# SourceTracker
+
+SourceTracker is run on a species-level OTU table using code by IMV. 
+
+## Create input dataset
+
+```{r}
+# Load OTU tables 
+sample_table <- read_tsv("<path_to>/DA_MALT_cRefSeq_species_summarized_20200616.txt")
+source_table <- read_tsv("<path_to>/sources_MALT_cRefSeq_JFY_species_summarized.txt")
+modern_table <- read_tsv("<path_to>/modern_plaque_species_summarized_cRefSeq_JFY_20210413.txt")
+
+# Combine OTU tables
+otu_table <- full_join(sample_table, full_join(source_table, modern_table))
+
+# Remove endings
+colnames(otu_table) <- gsub(".SG1.1.2_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam", 
+                           "", colnames(otu_table))
+colnames(otu_table) <- gsub(".SG1.1_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam", 
+                           "", colnames(otu_table))
+colnames(otu_table) <- gsub("MeganServer::", 
+                           "", colnames(otu_table))
+colnames(otu_table) <- gsub("_S0_L000_R1_000.fastq.merged.prefixed.hg19unmapped", 
+                           "", colnames(otu_table))
+colnames(otu_table) <- gsub(".SG1.2_S0_L003_R1_001.fastq.combined.fq.prefixed.extractunmapped.bam", 
+                           "", colnames(otu_table))
+colnames(otu_table) <- gsub("_S0_L001_R1_000.fastq.merged.prefixed.hg19unmapped", 
+                           "", colnames(otu_table))
+colnames(otu_table) <- gsub("_S0_L001_R1_001.fastq.combined.fq.prefixed.extractunmapped.bam", 
+                           "", colnames(otu_table))
+
+# Remove some JAE and VLC samples so there are only 10 in total
+otu_table <- otu_table %>%
+  select(-VLC008.A0101, -VLC009.A0101, -VLC010.A0101,
+         -JAE013.A0101, -JAE014.A0101, -JAE015.A0101, -JAE016.A0101)
+
+# Remove blanks
+otu_table <- otu_table %>%
+  select(-EXB037.A2101, -EXB037.A2201, -EXB037.A2301, -EXB037.A2401, -EXB037.A2501, -EXB037.A3301,
+         -LIB030.A0107, -LIB030.A0108, -LIB030.A0109, -LIB030.A0110, -LIB030.A0111, -LIB030.A0115)
+
+# Remove empty taxa
+otu_table$sum <- rowSums(otu_table[2:173])
+otu_table <- otu_table %>%
+  filter(!sum==0) %>%
+  dplyr::select(-sum)
+
+# Export
+write.table(otu_table, "<path_to>/otu_table_sourcetracker_species_20210607.txt", quote=FALSE, row.names=FALSE, sep="\t")
+```
+
+## Load data
+
+```{r message=FALSE}
+# Sink predictions
+sink <- read.delim("<path_to>/sink_predictions_shotgun_20210610.txt")
+
+# Metadata
+meta <- read_tsv("<path_to>/DA_metadata_new.txt")
+```
+
+## Cleaning
+
+Clean up the data by ordering by plaque proportion.
+
+```{r message=FALSE, warning=FALSE}
+# Combine sink predictions and metadata
+sinks_meta <- left_join(sink, meta, by=c("SampleID"="LibraryID")) %>% as_tibble
+
+# Remove blanks
+sinks_meta <- sinks_meta %>%
+  filter(!Type == "Blank")
+
+# Sum sources
+sinks_meta$plaques <- sinks_meta$subPlaque + sinks_meta$supPlaque
+sinks_meta$guts <- sinks_meta$ruralGut + sinks_meta$urbanGut
+sinks_meta$bones <- sinks_meta$boneCDM + sinks_meta$boneARS
+
+# Select only relevant columns
+sinks_meta <- sinks_meta %>%
+  select(SampleID, modernCalculus, plaques, bones, guts, sediment, skin, Unknown)
+
+# Sort by descending order of modern calculus
+sinks_meta2 <- sinks_meta %>% arrange(-modernCalculus)
+sinks_meta2$SampleID <- factor(sinks_meta2$SampleID, 
+                               levels = sinks_meta2$SampleID)
+
+# Convert to long format
+sinks_meta_long <- gather(sinks_meta2, key = "Source", value = "Value", 2:8)
+
+# Set colours for the sources
+env_colours <- c("#62749F","#C2B72B", "#172869", "#39BF88", "#C70E7B","#E43F7E",  "grey60")
+names(env_colours) <- c("bone", "gut", "sediment", "skin", "plaque", "modernCalculus", "Unknown")
+
+# Order the sources
+sinks_meta_long$Source <- factor(sinks_meta_long$Source, 
+                                 levels = c("Unknown", "sediment", "bone", "skin", "gut",  
+                                            "plaque", "modernCalculus"))
+
+```
+
+## Plotting
+
+```{r}
+st <- ggplot(sinks_meta_long, aes(SampleID, Value, fill = Source)) +
+  geom_bar(stat = "identity") +
+  ylab("Source proportion") +
+  xlab("Sample") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        axis.title.x=element_blank()) +
+  scale_fill_manual(values = env_colours)
+```
+
+# PCA with sources
+
+## Import data
+
+```{r message=FALSE, warning=FALSE}
+# Load OTU tables 
+sample_table <- read_tsv("<path_to>/DA_MALT_cRefSeq_genus_summarized_20200616.txt")
+source_table <- read_tsv("<path_to>/sources_MALT_cRefSeq_genus_summarized_JFY.txt")
+modern_table <- read_tsv("<path_to>/modern_plaque_genus_summarized_cRefSeq_JFY_20210413.txt")
+
+# Combine OTU tables
+otu_table <- full_join(sample_table, full_join(source_table, modern_table))
+
+# Load metadata file and order in alphabetical order
+meta <- read_tsv("<path_to>/da_mappingfile_20210528.txt")
+colnames(meta)[1] <- "SampleID"
+meta <- meta[order(meta$SampleID),] 
+
+# Turn the dataset into long format and order alphabetically
+megan_genus <- otu_table %>%
+  gather(sample, count, 2:192)
+colnames(megan_genus)[1] <- "genus"
+megan_genus <- megan_genus[order(megan_genus$sample),] 
+
+# Remove the parts that MEGAN adds to the sample name
+megan_genus <- megan_genus %>% 
+  mutate(sample = gsub(".SG1.1.2_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam", 
+                       "", sample)) %>% 
+  mutate(sample = gsub(".SG1.1_S0_L001_R1_001.fastq.combined.prefixed.fastq.extractunmapped.bam", 
+                       "", sample)) %>% 
+  mutate(sample = gsub("MeganServer::", 
+                       "", sample)) %>% 
+  mutate(sample = gsub("_S0_L000_R1_000.fastq.merged.prefixed.hg19unmapped", 
+                       "", sample)) %>% 
+  mutate(sample = gsub(".SG1.2_S0_L003_R1_001.fastq.combined.fq.prefixed.extractunmapped.bam", 
+                       "", sample)) %>% 
+  mutate(sample = gsub("_S0_L001_R1_000.fastq.merged.prefixed.hg19unmapped", 
+                       "", sample)) %>% 
+  mutate(sample = gsub("_S0_L001_R1_001.fastq.combined.fq.prefixed.extractunmapped.bam", 
+                       "", sample))
+```
+
+## Prepare data
+
+```{r message=FALSE, warning=FALSE}
+# Turn data back into wide format, but with genus as columns and libraries as rows
+megan_genus_wide <- spread(megan_genus, genus, count, fill = 0)
+
+# Combine metadata and data file
+megan_genus_wide_meta <- left_join(megan_genus_wide, meta, by=c("sample" = "SampleID"))
+```
+
+## Zero replacement, log ratio transform and PCA Functions
+
+Follow tutorial by Greg Gloor et al. for the multiplicative simple replacement zero-count correction and centered log ratio normalisation from (here)[https://github.com/ggloor/CoDa_microbiome_tutorial/wiki/Part-1:-Exploratory-Compositional-PCA-biplot], and put in a function.
+
+```{r message=FALSE, warning=FALSE}
+# Multiplicative zero replacement, with CLR transformation function "gloor"
+czm_clr_pca <- function(in_data){
+  ## Convert data to a matrix
+  wide_data <- in_data %>% 
+    dplyr::select(genus, sample, count) %>% 
+    spread(genus, count, fill = 0)
+  matrix <- as.matrix(wide_data[2:ncol(wide_data)])
+  rownames(matrix) <- wide_data$sample
+  ## Zero imputation through multiplicative simple replacement (estimated)
+  matrix.czm <- cmultRepl(matrix, label=0, method="CZM")
+  matrix.clr <- t(apply(matrix.czm, 1, function(x){log(x) - mean(log(x))}))
+  return(prcomp(matrix.clr))
+}
+
+# Apply function to data
+gloor_pca <- czm_clr_pca(megan_genus)
+```
+
+## Plotting 
+
+```{r message=FALSE, warning=FALSE}
+# Extract values
+pca_out <- as_tibble(gloor_pca$x)
+pca_out$sample <- megan_genus_wide_meta$sample
+pca_out_meta <- left_join(pca_out, meta, by=c("sample" = "SampleID"))
+
+# Calculate percent explained per PC
+percentage <- round(gloor_pca$sdev / sum(gloor_pca$sdev) * 100, 2)
+percentage <- paste(colnames(pca_out), "(", paste( as.character(percentage), "%", ")", sep="") )
+
+# Set shapes for published/this study
+my_shapes = c(16, 4, 4, 4, 4, 4, 4, 4, 4)
+names(my_shapes) <- c("ThisStudy", "Kovsgol", "Sankaranarayanan2015", "ObregonTito2015", "Slon2017", "Rampelli?2015", "HMP2012", "Oh2016", "Fellows2021")
+
+# Set colours for environment
+env_colours <- c("black", "#62749F","#C2B72B", "#172869", "#39BF88", "#C70E7B","#E43F7E",  "grey60")
+names(env_colours) <- c("calculus", "bone", "gut", "sediment", "skin", "plaque", "modernCalculus", "blank")
+```
+
+And plot!
+
+```{r message=FALSE, warning=FALSE}
+pca <- ggplot(data = pca_out_meta, aes(x = PC2, y = PC3, colour=Env)) +
+  geom_point(size=3, stroke=3, aes(shape=Study)) +
+  scale_color_manual(values=env_colours) +
+  scale_shape_manual(values=my_shapes) +
+  xlab(percentage[1]) + 
+  ylab(percentage[2]) +
+  guides(fill=guide_legend(override.aes=list(shape=21, size=5))) +
+  theme_minimal()
+```
+
+# Ancient reads
+
+In order to show that the data is ancient, the reads were mapped to Tannerella forsythia without mapping quality filtering, using EAGER1. TF is present in all samples. we'll look at damage and fragment length of mapped reads.
+
+```{r}
+# Load raw data
+damage <- read.delim("<path_to>/TanFor_damage_all_20200805.txt")
+colnames(damage)[1] <- "Location"
+colnames(damage)[3] <- "CtoT5p"
+
+# Get column with library ID
+damage$LibraryID <- sapply(strsplit(as.character(damage$Location), "/"), tail, 1)
+damage <- damage %>%
+  dplyr::select(-Location)
+damage$LibraryID <- sapply(strsplit(as.character(damage$LibraryID), "_"), head, 1)
+
+# Keep only c>T in first 5 bases
+damage <- damage %>%
+  filter(pos < 6)
+
+# Load metadata
+meta <- read.delim("<path_to>/DA_metadata_new.txt")
+
+# Add metadata
+damage_meta <- left_join(damage, meta)
+
+# Set colours for individual
+my_colors = c("#C70E7B", "#A6E000", "#6C6C9D", "#1BB6AF")
+names(my_colors) = damage_meta$Individual %>% unique %>% sort
+```
+
+Now try to plot
+
+```{r}
+damage_fig <- ggplot(damage_meta, aes(x=pos, y=CtoT5p, group=LibraryID, colour=Individual)) +
+  geom_line(size=1) +
+  ylab("5' C>T") +
+  xlab("Position") +
+  #facet_wrap(~Individual) +
+  scale_color_manual(values=my_colors) +
+  theme_minimal()
+```
+
+## Fragment length
+
+```{r}
+# Load EAGER report and select onlyy necessary columns
+eager <- read.csv("<path_to>/report_tannerella_forsythia_20200806.csv") %>%
+  select(Sample.Name, median.fragment.length)
+
+# Load metadata
+meta <- read.delim("<path_to>/DA_metadata_new.txt")
+
+# Add metadata
+eager_meta <- left_join(eager, meta, by=c("Sample.Name" = "LibraryID"))
+
+# Remove blanks and bones
+eager_meta <- eager_meta %>%
+  filter(Type == "Calculus")
+
+# Set colours for individual
+my_colors = c("#C70E7B", "#A6E000", "#6C6C9D", "#1BB6AF")
+names(my_colors) = length_meta$Individual %>% unique %>% sort
+```
+
+Let's do a boxplot per individual.
+
+```{r}
+length_fig <- ggplot(eager_meta, aes(x=Individual, y=median.fragment.length)) +
+  stat_boxplot(geom='errorbar') +
+  geom_boxplot(outlier.shape=NA) +
+  geom_jitter(aes(col=Individual), width = 0.1) +
+  scale_color_manual(values=my_colors, guide=FALSE) +
+  ylab("Median fragment length") +
+  theme_minimal()
+```
+
+These plots will go together, so let's combine them already at this stage.
+
+```{r}
+ancient_fig <- ggarrange(damage_fig, length_fig,
+                           ncol=1, nrow=2, widths = c(3, 2))
+```
+
