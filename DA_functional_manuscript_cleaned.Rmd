@@ -12,6 +12,7 @@ library(janitor)
 library(vegan)
 library(decontam)
 library(zCompositions)
+library(ggpubr)
 library(tidyverse)
 ```
 
@@ -200,6 +201,28 @@ p <- ggplot(data = gene_pca_out_meta, aes(x = PC1, y = PC2, colour=Individual)) 
   ylab(gene_percentage[2]) +
   guides(fill=guide_legend(override.aes=list(shape=21, size=5))) +
   theme_minimal()
+
+# Set shapes for tooth surface
+sur_shapes = c(21, 22, 24)
+names(sur_shapes) = gene_pca_out_meta$ToothSide %>% unique()
+
+# Set fill for tooth surface
+pos_col = c("black", "white")
+names(pos_col) = gene_pca_out_meta$ToothPosition %>% unique()
+
+# Surface, position and mass
+result_pca <- ggplot(data = gene_pca_out_meta, aes(x = PC1, y = PC2, colour=TotalWeight_scaled, fill=ToothPosition)) +
+  geom_point(size=5, stroke=5, aes(shape=ToothSide)) +
+  scale_color_gradientn(colours=c("#1BB6AF", "#A6E000", "#C70E7B")) +
+  scale_shape_manual(values=sur_shapes) +
+  scale_fill_manual(values=(c("black", "white"))) +
+  xlab(gene_percentage[1]) + 
+  ylab(gene_percentage[2]) +
+  guides(fill=guide_legend(override.aes=list(shape=21, size=5))) +
+  theme_minimal()
+
+# Combine PCAs
+ggarrange(p, result_pca, ncol=2)
 ```
 
 ### PERMANOVA
