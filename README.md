@@ -5,4 +5,4 @@ Scripts used for analyses in the project:
 
 Authors: Zandra Fagernäs, Domingo C. Salazar-García, Azucena Avilés, María Haber, Amanda Henry, Joaquín Lomba Maurandi, Andrew Ozga, Irina M Velsko, Christina Warinner
 
-The manuscript is available at XXXX.
+The manuscript is available at https://doi.org/10.1093/femsmc/xtac006.
